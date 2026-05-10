@@ -1,0 +1,196 @@
+---
+title: "Database Quality Report"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    number_sections: true
+params:
+  db_data: !r data.frame()
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+
+# Load the data passed from the Shiny app
+df <- params$db_data
+```
+
+# Executive Summary
+
+This report summarises the current state of the patient database. It was generated on **`r Sys.Date()`** and contains **`r nrow(df)`** patient records with **`r ncol(df)`** variables.
+
+---
+
+# Database Overview
+
+```{r overview_table}
+# Basic info about the dataset
+overview <- data.frame(
+  Metric = c("Total Records", "Total Variables", "Report Generated"),
+  Value  = c(nrow(df), ncol(df), as.character(Sys.Date()))
+)
+kable(overview, caption = "General Database Statistics")
+```
+
+## First rows of data
+
+```{r head_table}
+kable(head(df, 10), caption = "First 10 records in the database")
+```
+
+---
+
+# Quality Metric 1: Completeness (Missing Values)
+
+We check how many values are missing (`NA`) in each variable. Variables with high missing percentages may need attention.
+
+```{r completeness_table}
+missing_pct <- sapply(df, function(x) round(sum(is.na(x)) / nrow(df) * 100, 2))
+completeness_df <- data.frame(
+  Variable           = names(missing_pct),
+  Missing_Count      = sapply(df, function(x) sum(is.na(x))),
+  Missing_Percentage = missing_pct,
+  row.names          = NULL
+)
+kable(completeness_df, caption = "Missing values per variable")
+```
+
+```{r completeness_plot, fig.width=8, fig.height=5}
+# Red bars = variables with missing data, blue = complete
+ggplot(completeness_df, aes(x = reorder(Variable, Missing_Percentage),
+                             y = Missing_Percentage,
+                             fill = Missing_Percentage > 0)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  scale_fill_manual(values = c("FALSE" = "steelblue", "TRUE" = "tomato"),
+                    labels = c("Complete", "Has Missing"),
+                    name   = "Status") +
+  theme_minimal(base_size = 13) +
+  labs(title = "Missing Data (%) per Variable",
+       x = "Variable", y = "Missing (%)")
+```
+
+**Interpretation:** Variables shown in red have at least one missing value and should be reviewed.
+
+---
+
+# Quality Metric 2: Consistency (Sex Variable)
+
+We check whether the `Sex` variable only contains expected values (Male, Female, Other). Any other values indicate data entry errors.
+
+```{r consistency}
+if ("Sex" %in% colnames(df)) {
+  sex_table <- as.data.frame(table(df$Sex, useNA = "ifany"))
+  colnames(sex_table) <- c("Value", "Count")
+  sex_table$Percentage <- round(sex_table$Count / sum(sex_table$Count) * 100, 2)
+
+  standard_values <- c("Male", "Female", "Other", "m", "f", "M", "F")
+  non_standard <- sex_table[!sex_table$Value %in% standard_values & !is.na(sex_table$Value), ]
+
+  kable(sex_table, caption = "Distribution of the Sex variable (including NAs)")
+} else {
+  cat("Variable 'Sex' not found in the database.")
+}
+```
+
+```{r consistency_alert, results='asis'}
+# Show a pass/fail message depending on whether non-standard values exist
+if ("Sex" %in% colnames(df)) {
+  if (nrow(non_standard) > 0) {
+    cat("> **WARNING:** Non-standard values found in Sex:",
+        paste(non_standard$Value, collapse = ", "), "\n")
+  } else {
+    cat("> **PASS:** All values in Sex are within the expected range.\n")
+  }
+}
+```
+
+---
+
+# Quality Metric 3: Accuracy (Dosage Outliers)
+
+We use the IQR method to detect extreme dosage values that may indicate data entry mistakes or unusual cases. Values below Q1 − 1.5×IQR or above Q3 + 1.5×IQR are flagged as outliers.
+
+```{r accuracy_plot, fig.width=7, fig.height=5}
+if ("Dosage_mg" %in% colnames(df)) {
+  df$Dosage_mg <- suppressWarnings(as.numeric(df$Dosage_mg))
+
+  ggplot(df, aes(y = Dosage_mg)) +
+    geom_boxplot(fill = "tomato", color = "darkred",
+                 outlier.color = "black", outlier.size = 3) +
+    theme_minimal(base_size = 13) +
+    labs(title = "Dosage Distribution with Outliers",
+         y = "Dosage (mg)") +
+    theme(axis.text.x = element_blank(), axis.ticks.x = element_blank())
+} else {
+  cat("Variable 'Dosage_mg' not found in the database.")
+}
+```
+
+```{r accuracy_table}
+if ("Dosage_mg" %in% colnames(df)) {
+  df$Dosage_mg <- suppressWarnings(as.numeric(df$Dosage_mg))
+  q1  <- quantile(df$Dosage_mg, 0.25, na.rm = TRUE)
+  q3  <- quantile(df$Dosage_mg, 0.75, na.rm = TRUE)
+  iqr <- q3 - q1
+  lower_bound <- q1 - 1.5 * iqr
+  upper_bound <- q3 + 1.5 * iqr
+
+  outliers <- df[!is.na(df$Dosage_mg) &
+                   (df$Dosage_mg < lower_bound | df$Dosage_mg > upper_bound), ]
+
+  # Summary table of dosage statistics
+  stats_df <- data.frame(
+    Statistic = c("Minimum", "Q1 (25th pct)", "Median", "Q3 (75th pct)",
+                  "Maximum", "IQR", "Lower fence", "Upper fence", "Outlier count"),
+    Value = c(min(df$Dosage_mg, na.rm = TRUE), q1,
+              median(df$Dosage_mg, na.rm = TRUE), q3,
+              max(df$Dosage_mg, na.rm = TRUE), iqr,
+              lower_bound, upper_bound, nrow(outliers))
+  )
+  kable(stats_df, caption = "Dosage summary statistics")
+
+  if (nrow(outliers) > 0) {
+    kable(head(outliers, 20), caption = "Records flagged as dosage outliers (first 20)")
+  }
+}
+```
+
+---
+
+# Audit Log
+
+> **Note:** A complete audit trail (user, timestamp, action) is stored in the `audit_logs` table of the SQLite database. It is not included in this report to protect user privacy.
+
+---
+
+# Conclusions
+
+```{r conclusions, results='asis'}
+total    <- nrow(df)
+any_miss <- any(sapply(df, function(x) sum(is.na(x))) > 0)
+
+# Count dosage outliers
+dose_flag <- if ("Dosage_mg" %in% colnames(df)) {
+  d  <- suppressWarnings(as.numeric(df$Dosage_mg))
+  q1 <- quantile(d, 0.25, na.rm = TRUE)
+  q3 <- quantile(d, 0.75, na.rm = TRUE)
+  sum(d < q1 - 1.5 * (q3 - q1) | d > q3 + 1.5 * (q3 - q1), na.rm = TRUE)
+} else 0
+
+cat(sprintf("- **Total records analysed:** %d\n", total))
+cat(sprintf("- **Missing values present:** %s\n",
+    if (any_miss) "Yes – review required" else "No – database is complete"))
+cat(sprintf("- **Dosage outliers detected:** %d record(s)\n", dose_flag))
+cat("\nThese findings should be reviewed by the data manager before any further analysis.\n")
+```
+
+---
+
+*Report generated automatically by the Biomedical Data Hub · `r format(Sys.time(), "%Y-%m-%d %H:%M:%S")`*
